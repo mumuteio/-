@@ -1,0 +1,391 @@
+"""
+三星健康数据导入Strava工具
+支持将三星健康导出的数据转换为GPX格式并上传到Strava
+"""
+
+import json
+import csv
+from datetime import datetime, timedelta
+from pathlib import Path
+import requests
+from xml.etree.ElementTree import Element, SubElement, tostring
+from xml.dom import minidom
+
+class SamsungHealthToStrava:
+    def __init__(self, strava_access_token=None):
+        """
+        初始化转换工具
+        
+        Args:
+            strava_access_token: Strava API访问令牌
+        """
+        self.strava_access_token = strava_access_token
+        self.strava_upload_url = "https://www.strava.com/api/v3/uploads"
+    
+    def parse_samsung_health_csv(self, csv_file_path):
+        """
+        解析三星健康导出的CSV文件
+        三星健康CSV格式特殊：第1行是文件信息，第2行是列名，第3行开始是数据
+        
+        Args:
+            csv_file_path: CSV文件路径
+            
+        Returns:
+            解析后的运动数据列表
+        """
+        activities = []
+        
+        print(f"正在读取文件: {csv_file_path}")
+        
+        with open(csv_file_path, 'r', encoding='utf-8-sig') as f:
+            # 读取所有行
+            lines = f.readlines()
+            
+            if len(lines) < 3:
+                print("⚠️  文件行数太少，可能没有数据")
+                return activities
+            
+            # 跳过第一行（文件头），从第二行开始读取
+            # 第二行是列名
+            header_line = lines[1].strip()
+            headers = [h.strip() for h in header_line.split(',')]
+            
+            print(f"✓ 找到 {len(headers)} 个列")
+            print(f"✓ 数据从第 3 行开始\n")
+            
+            # 从第三行开始是数据
+            for line_num, line in enumerate(lines[2:], start=3):
+                line = line.strip()
+                if not line:
+                    continue
+                
+                # 分割数据
+                values = line.split(',')
+                
+                # 创建字典
+                row = {}
+                for i, value in enumerate(values):
+                    if i < len(headers):
+                        row[headers[i]] = value.strip()
+                
+                # 提取需要的字段
+                activity = {
+                    'start_time': row.get('com.samsung.health.exercise.start_time', ''),
+                    'end_time': row.get('com.samsung.health.exercise.end_time', ''),
+                    'distance': self._parse_float(row.get('com.samsung.health.exercise.distance', 0)),
+                    'duration': self._parse_float(row.get('com.samsung.health.exercise.duration', 0)),
+                    'calorie': self._parse_float(row.get('com.samsung.health.exercise.calorie', 0)),
+                    'exercise_type': row.get('com.samsung.health.exercise.exercise_type', ''),
+                    'mean_heart_rate': row.get('com.samsung.health.exercise.mean_heart_rate', ''),
+                    'max_heart_rate': row.get('com.samsung.health.exercise.max_heart_rate', ''),
+                    'mean_speed': self._parse_float(row.get('com.samsung.health.exercise.mean_speed', 0)),
+                    'max_speed': self._parse_float(row.get('com.samsung.health.exercise.max_speed', 0)),
+                    'altitude_gain': self._parse_float(row.get('com.samsung.health.exercise.altitude_gain', 0)),
+                    'altitude_loss': self._parse_float(row.get('com.samsung.health.exercise.altitude_loss', 0)),
+                }
+                
+                # 只添加有有效开始时间的活动
+                if activity['start_time']:
+                    activities.append(activity)
+        
+        return activities
+    
+    def _parse_float(self, value):
+        """安全地解析浮点数"""
+        try:
+            return float(value) if value else 0
+        except (ValueError, TypeError):
+            return 0
+    
+    def create_gpx(self, activity, output_file):
+        """
+        创建GPX文件
+        
+        Args:
+            activity: 运动数据字典
+            output_file: 输出文件路径
+        """
+        # 创建GPX根元素
+        gpx = Element('gpx', {
+            'version': '1.1',
+            'creator': 'Samsung Health to Strava Converter',
+            'xmlns': 'http://www.topografix.com/GPX/1/1',
+            'xmlns:gpxtpx': 'http://www.garmin.com/xmlschemas/TrackPointExtension/v1',
+            'xmlns:xsi': 'http://www.w3.org/2001/XMLSchema-instance',
+            'xsi:schemaLocation': 'http://www.topografix.com/GPX/1/1 http://www.topografix.com/GPX/1/1/gpx.xsd'
+        })
+        
+        # 添加元数据
+        metadata = SubElement(gpx, 'metadata')
+        time_elem = SubElement(metadata, 'time')
+        start_dt = self._parse_datetime(activity['start_time'])
+        time_elem.text = start_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+        
+        # 添加轨迹
+        trk = SubElement(gpx, 'trk')
+        name = SubElement(trk, 'name')
+        name.text = f"{activity['exercise_type']} - {start_dt.strftime('%Y-%m-%d %H:%M')}"
+        
+        type_elem = SubElement(trk, 'type')
+        type_elem.text = self._map_sport_type(activity['exercise_type'])
+        
+        trkseg = SubElement(trk, 'trkseg')
+        
+        # 创建轨迹点（简化版本，因为CSV可能没有GPS数据）
+        # 创建起点和终点，中间插入一些点使轨迹看起来更自然
+        duration_seconds = activity['duration'] / 1000  # 转换为秒
+        distance_meters = activity['distance']
+        
+        # 生成多个轨迹点（每分钟一个点）
+        num_points = max(2, int(duration_seconds / 60) + 2)
+        
+        for i in range(num_points):
+            # 简单的线性插值
+            time_offset = (duration_seconds / (num_points - 1)) * i if num_points > 1 else 0
+            point_time = start_dt + timedelta(seconds=time_offset)
+            
+            trkpt = SubElement(trkseg, 'trkpt', {'lat': '0.0', 'lon': '0.0'})
+            ele = SubElement(trkpt, 'ele')
+            ele.text = '0'
+            time_pt = SubElement(trkpt, 'time')
+            time_pt.text = point_time.strftime('%Y-%m-%dT%H:%M:%SZ')
+            
+            # 添加心率数据（如果有）
+            if activity['mean_heart_rate']:
+                extensions = SubElement(trkpt, 'extensions')
+                tpx = SubElement(extensions, 'gpxtpx:TrackPointExtension')
+                hr = SubElement(tpx, 'gpxtpx:hr')
+                hr.text = str(int(float(activity['mean_heart_rate'])))
+        
+        # 格式化XML
+        xml_str = minidom.parseString(tostring(gpx)).toprettyxml(indent='  ')
+        
+        with open(output_file, 'w', encoding='utf-8') as f:
+            f.write(xml_str)
+        
+        print(f"  ✓ GPX文件已创建: {output_file}")
+    
+    def _parse_datetime(self, dt_string):
+        """解析日期时间字符串"""
+        # 三星健康的时间戳通常是毫秒级
+        try:
+            # 尝试作为时间戳解析（毫秒）
+            timestamp = int(dt_string)
+            return datetime.fromtimestamp(timestamp / 1000)
+        except (ValueError, TypeError):
+            pass
+        
+        # 尝试解析不同的日期格式
+        for fmt in ['%Y-%m-%d %H:%M:%S.%f', '%Y-%m-%d %H:%M:%S', '%m/%d/%Y %H:%M:%S']:
+            try:
+                return datetime.strptime(dt_string, fmt)
+            except ValueError:
+                continue
+        
+        # 默认返回当前时间
+        return datetime.now()
+    
+    def _map_sport_type(self, samsung_type):
+        """映射三星健康的运动类型到Strava类型"""
+        # 三星健康的exercise_type通常是数字代码
+        type_mapping = {
+            '1001': 'walking',
+            '1002': 'running',
+            '11007': 'cycling',
+            '14001': 'swimming',
+            '15001': 'hiking',
+            # 更多类型映射
+        }
+        
+        # 如果是数字代码
+        if str(samsung_type).isdigit():
+            return type_mapping.get(str(samsung_type), 'workout')
+        
+        # 如果是文本
+        text_mapping = {
+            'Running': 'running',
+            'Walking': 'walking',
+            'Cycling': 'cycling',
+            'Swimming': 'swimming',
+            'Hiking': 'hiking',
+            'Workout': 'workout',
+        }
+        return text_mapping.get(samsung_type, 'workout')
+    
+    def upload_to_strava(self, gpx_file, activity_name=None, description=None, use_proxy=False):
+        """
+        上传GPX文件到Strava
+        
+        Args:
+            gpx_file: GPX文件路径
+            activity_name: 活动名称
+            description: 活动描述
+            use_proxy: 是否使用系统代理
+            
+        Returns:
+            上传结果
+        """
+        if not self.strava_access_token:
+            print("  ⚠️  未设置Strava访问令牌，跳过上传")
+            return None
+        
+        headers = {
+            'Authorization': f'Bearer {self.strava_access_token}'
+        }
+        
+        # 配置代理（如果需要）
+        proxies = None
+        if not use_proxy:
+            # 禁用代理
+            proxies = {
+                'http': None,
+                'https': None
+            }
+        
+        try:
+            with open(gpx_file, 'rb') as f:
+                files = {'file': f}
+                data = {
+                    'data_type': 'gpx',
+                }
+                if activity_name:
+                    data['name'] = activity_name
+                if description:
+                    data['description'] = description
+                
+                response = requests.post(
+                    self.strava_upload_url,
+                    headers=headers,
+                    files=files,
+                    data=data,
+                    proxies=proxies,
+                    timeout=30
+                )
+            
+            if response.status_code == 201:
+                result = response.json()
+                print(f"  ✓ 上传成功! 活动ID: {result.get('id')}")
+                return result
+            else:
+                print(f"  ✗ 上传失败: {response.status_code}")
+                print(f"    {response.text}")
+                return None
+        
+        except requests.exceptions.ProxyError as e:
+            print(f"  ✗ 代理错误: {str(e)}")
+            print(f"    提示: 可以尝试关闭VPN或在Strava网页手动上传GPX文件")
+            return None
+        except requests.exceptions.RequestException as e:
+            print(f"  ✗ 网络错误: {str(e)}")
+            return None
+
+
+def load_strava_token():
+    """从strava_tokens.json加载访问令牌"""
+    try:
+        with open('strava_tokens.json', 'r') as f:
+            tokens = json.load(f)
+            return tokens.get('access_token')
+    except FileNotFoundError:
+        return None
+
+
+def main():
+    """主函数"""
+    print("=" * 60)
+    print("         三星健康数据导入Strava工具")
+    print("=" * 60)
+    print()
+    
+    # 1. 设置文件路径
+    data_folder = r"E:\a\samsunghealth_8618535493618_20251104223871"
+    
+    # 自动查找exercise文件（可能是health或shealth）
+    csv_file = None
+    for pattern in ["com.samsung.shealth.exercise*.csv", "com.samsung.health.exercise*.csv"]:
+        for file in Path(data_folder).glob(pattern):
+            csv_file = file
+            break
+        if csv_file:
+            break
+    
+    if not csv_file:
+        # 如果找不到，尝试手动指定
+        csv_file = Path(data_folder) / "com.samsung.shealth.exercise.20251104223871.csv"
+    
+    print(f"数据文件夹: {data_folder}")
+    print(f"运动数据文件: {csv_file.name}")
+    print()
+    
+    # 检查文件是否存在
+    if not csv_file.exists():
+        print(f"❌ 错误: 找不到文件 {csv_file}")
+        print("\n可用的CSV文件:")
+        for file in Path(data_folder).glob("*.csv"):
+            print(f"  - {file.name}")
+        return
+    
+    # 2. 加载Strava访问令牌
+    access_token = load_strava_token()
+    
+    if access_token:
+        print("✓ 已加载Strava访问令牌")
+    else:
+        print("⚠️  未找到Strava访问令牌 (strava_tokens.json)")
+        print("   将只创建GPX文件，不会上传到Strava")
+    print()
+    
+    # 3. 创建转换器
+    converter = SamsungHealthToStrava(strava_access_token=access_token)
+    
+    # 4. 解析CSV文件
+    try:
+        activities = converter.parse_samsung_health_csv(csv_file)
+        print(f"✓ 找到 {len(activities)} 条运动记录\n")
+        print("=" * 60)
+        
+        # 5. 处理每个活动
+        output_folder = Path("gpx_files")
+        output_folder.mkdir(exist_ok=True)
+        
+        for i, activity in enumerate(activities, 1):
+            print(f"\n[{i}/{len(activities)}] 处理活动:")
+            print(f"  类型: {activity['exercise_type']}")
+            print(f"  开始时间: {activity['start_time']}")
+            print(f"  距离: {activity['distance']:.2f} 米")
+            print(f"  时长: {activity['duration']/1000/60:.1f} 分钟")
+            print(f"  卡路里: {activity['calorie']:.0f}")
+            
+            if activity['mean_heart_rate']:
+                print(f"  平均心率: {activity['mean_heart_rate']} bpm")
+            
+            # 创建GPX文件
+            output_file = output_folder / f"activity_{i:03d}.gpx"
+            converter.create_gpx(activity, output_file)
+            
+            # 上传到Strava（如果有令牌）
+            # 默认不自动上传，避免网络问题
+            # 如果需要上传，取消下面的注释
+            # if access_token:
+            #     upload = input("  是否上传到Strava? (y/n，直接回车跳过): ").strip().lower()
+            #     if upload == 'y':
+            #         start_dt = converter._parse_datetime(activity['start_time'])
+            #         activity_name = f"{activity['exercise_type']} - {start_dt.strftime('%Y-%m-%d')}"
+            #         converter.upload_to_strava(
+            #             output_file,
+            #             activity_name=activity_name,
+            #             use_proxy=False  # 设置为False禁用代理
+            #         )
+        
+        print("\n" + "=" * 60)
+        print(f"✓ 完成! GPX文件已保存到: {output_folder.absolute()}")
+        print("=" * 60)
+    
+    except Exception as e:
+        print(f"\n❌ 错误: {str(e)}")
+        import traceback
+        traceback.print_exc()
+
+
+if __name__ == "__main__":
+    main()
