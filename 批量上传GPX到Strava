@@ -1,0 +1,239 @@
+"""
+批量上传GPX文件到Strava
+自动上传gpx_files文件夹中的所有GPX文件
+"""
+
+import json
+import time
+import requests
+from pathlib import Path
+
+
+def load_strava_token():
+    """从strava_tokens.json加载访问令牌"""
+    try:
+        with open('strava_tokens.json', 'r') as f:
+            tokens = json.load(f)
+            return tokens.get('access_token')
+    except FileNotFoundError:
+        print("❌ 找不到 strava_tokens.json 文件")
+        print("请先运行 strava_auth.py 获取访问令牌")
+        return None
+
+
+def upload_gpx_to_strava(gpx_file, access_token, activity_name=None):
+    """
+    上传单个GPX文件到Strava
+    
+    Args:
+        gpx_file: GPX文件路径
+        access_token: Strava访问令牌
+        activity_name: 活动名称（可选）
+    
+    Returns:
+        (success, message) 元组
+    """
+    url = "https://www.strava.com/api/v3/uploads"
+    
+    headers = {
+        'Authorization': f'Bearer {access_token}'
+    }
+    
+    # 禁用代理
+    proxies = {
+        'http': None,
+        'https': None
+    }
+    
+    try:
+        with open(gpx_file, 'rb') as f:
+            files = {'file': f}
+            data = {'data_type': 'gpx'}
+            
+            if activity_name:
+                data['name'] = activity_name
+            
+            response = requests.post(
+                url,
+                headers=headers,
+                files=files,
+                data=data,
+                proxies=proxies,
+                timeout=30
+            )
+        
+        if response.status_code == 201:
+            result = response.json()
+            activity_id = result.get('id', 'unknown')
+            return True, f"成功 (ID: {activity_id})"
+        elif response.status_code == 401:
+            return False, "令牌无效或已过期"
+        else:
+            error_msg = response.json().get('message', response.text)
+            return False, f"失败 ({response.status_code}): {error_msg}"
+    
+    except requests.exceptions.ProxyError:
+        return False, "代理错误（请关闭VPN或代理）"
+    except requests.exceptions.Timeout:
+        return False, "请求超时"
+    except requests.exceptions.RequestException as e:
+        return False, f"网络错误: {str(e)}"
+    except Exception as e:
+        return False, f"未知错误: {str(e)}"
+
+
+def batch_upload(gpx_folder, access_token, delay=2, start_from=1, max_files=None):
+    """
+    批量上传GPX文件
+    
+    Args:
+        gpx_folder: GPX文件夹路径
+        access_token: Strava访问令牌
+        delay: 每次上传之间的延迟（秒），避免API限制
+        start_from: 从第几个文件开始上传
+        max_files: 最多上传多少个文件（None表示全部）
+    """
+    gpx_path = Path(gpx_folder)
+    
+    if not gpx_path.exists():
+        print(f"❌ 文件夹不存在: {gpx_folder}")
+        return
+    
+    # 获取所有GPX文件并排序
+    gpx_files = sorted(gpx_path.glob("*.gpx"))
+    total_files = len(gpx_files)
+    
+    if total_files == 0:
+        print(f"❌ 在 {gpx_folder} 中没有找到GPX文件")
+        return
+    
+    print(f"✓ 找到 {total_files} 个GPX文件")
+    
+    # 应用起始位置和最大数量限制
+    if start_from > 1:
+        gpx_files = gpx_files[start_from - 1:]
+        print(f"✓ 从第 {start_from} 个文件开始")
+    
+    if max_files:
+        gpx_files = gpx_files[:max_files]
+        print(f"✓ 限制上传 {max_files} 个文件")
+    
+    print(f"\n开始上传 {len(gpx_files)} 个文件...\n")
+    print("=" * 70)
+    
+    success_count = 0
+    failed_count = 0
+    failed_files = []
+    
+    for i, gpx_file in enumerate(gpx_files, start=start_from):
+        file_name = gpx_file.name
+        print(f"\n[{i}/{total_files}] {file_name}")
+        
+        # 上传文件
+        success, message = upload_gpx_to_strava(gpx_file, access_token)
+        
+        if success:
+            print(f"  ✓ {message}")
+            success_count += 1
+        else:
+            print(f"  ✗ {message}")
+            failed_count += 1
+            failed_files.append((file_name, message))
+            
+            # 如果是令牌错误，停止上传
+            if "令牌" in message or "401" in message:
+                print("\n⚠️  检测到令牌问题，停止上传")
+                print("请重新运行 strava_auth.py 获取新的访问令牌")
+                break
+        
+        # 延迟，避免API限制
+        if i < total_files and success:
+            print(f"  等待 {delay} 秒...")
+            time.sleep(delay)
+    
+    # 显示总结
+    print("\n" + "=" * 70)
+    print("上传完成!")
+    print("=" * 70)
+    print(f"✓ 成功: {success_count} 个")
+    print(f"✗ 失败: {failed_count} 个")
+    
+    if failed_files:
+        print(f"\n失败的文件:")
+        for file_name, reason in failed_files:
+            print(f"  - {file_name}: {reason}")
+    
+    print("=" * 70)
+
+
+def main():
+    """主函数"""
+    print("=" * 70)
+    print("         批量上传GPX文件到Strava")
+    print("=" * 70)
+    print()
+    
+    # 加载访问令牌
+    access_token = load_strava_token()
+    
+    if not access_token:
+        return
+    
+    print("✓ 已加载Strava访问令牌")
+    print()
+    
+    # GPX文件夹
+    gpx_folder = "gpx_files"
+    
+    # 上传设置
+    print("上传设置:")
+    print(f"  文件夹: {gpx_folder}")
+    print(f"  每次上传间隔: 2秒")
+    print()
+    
+    # 询问用户
+    print("选择上传模式:")
+    print("  1. 上传全部文件")
+    print("  2. 自定义范围（从第X个开始，上传Y个）")
+    print("  3. 测试模式（只上传前5个）")
+    
+    choice = input("\n请选择 (1/2/3，默认1): ").strip() or "1"
+    print()
+    
+    if choice == "1":
+        # 全部上传
+        confirm = input(f"确认上传全部GPX文件? (y/n): ").strip().lower()
+        if confirm == 'y':
+            batch_upload(gpx_folder, access_token, delay=2)
+        else:
+            print("已取消")
+    
+    elif choice == "2":
+        # 自定义范围
+        start_from = input("从第几个文件开始? (默认1): ").strip()
+        start_from = int(start_from) if start_from.isdigit() else 1
+        
+        max_files = input("上传多少个文件? (默认全部): ").strip()
+        max_files = int(max_files) if max_files.isdigit() else None
+        
+        confirm = input(f"\n确认从第{start_from}个开始上传? (y/n): ").strip().lower()
+        if confirm == 'y':
+            batch_upload(gpx_folder, access_token, delay=2, start_from=start_from, max_files=max_files)
+        else:
+            print("已取消")
+    
+    elif choice == "3":
+        # 测试模式
+        print("测试模式：只上传前5个文件")
+        confirm = input("确认继续? (y/n): ").strip().lower()
+        if confirm == 'y':
+            batch_upload(gpx_folder, access_token, delay=2, max_files=5)
+        else:
+            print("已取消")
+    
+    else:
+        print("❌ 无效选择")
+
+
+if __name__ == "__main__":
+    main()
